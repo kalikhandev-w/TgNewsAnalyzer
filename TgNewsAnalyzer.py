@@ -3,6 +3,11 @@ import os
 import re
 import math
 import traceback
+import multiprocessing
+
+# The frozen app re-runs itself for multiprocessing helpers (tqdm's lock starts the resource tracker on the
+# first encode); divert them here, or each one opens a second app on the same Telegram session
+multiprocessing.freeze_support()
 import pandas as pd
 import spacy
 import asyncio
