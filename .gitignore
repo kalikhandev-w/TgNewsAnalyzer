@@ -5,7 +5,12 @@ __pycache__/
 *.so
 .Python
 venv/
+venv-build/
 ENV/
+
+# Build output (build_mac.sh)
+build/
+dist/
 
 # IDE
 .idea/

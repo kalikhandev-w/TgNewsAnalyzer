@@ -1,0 +1,5 @@
+-r requirements.txt
+pyinstaller==6.22.3
+pyinstaller-hooks-contrib==2026.10
+# On macOS 14+ pip picks scipy's Accelerate wheel, which needs macOS 14; this OpenBLAS wheel runs on macOS 12.3
+scipy @ https://files.pythonhosted.org/packages/b2/02/cf107b01494c19dc100f1d0b7ac3cc08666e96ba2d64db7626066cee895e/scipy-1.17.1-cp312-cp312-macosx_12_0_arm64.whl#sha256=fcb310ddb270a06114bb64bbe53c94926b943f5b7f0842194d585c65eb4edd76
