@@ -1,4 +1,5 @@
 import sys
+import os
 import re
 import math
 import traceback
@@ -9,30 +10,40 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QPushButton, QVBoxLayout, 
     QWidget, QFileDialog, QTableWidget, QTableWidgetItem, 
     QProgressBar, QDateEdit, QLabel, QHBoxLayout, QHeaderView,
-    QDialog, QLineEdit, QMessageBox, QProgressDialog, QTextEdit, QCheckBox
+    QDialog, QLineEdit, QMessageBox, QProgressDialog, QTextEdit, QCheckBox,
+    QInputDialog
 )
 from PyQt5.QtCore import QDate, pyqtSignal, Qt, QTimer
+from PyQt5.QtGui import QIcon, QPixmap, QPainter
+from qr_render import qr_matrix
 from docx import Document
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError
 from qasync import QEventLoop, asyncSlot
 from datetime import datetime, timedelta, timezone
+from timeutils import KZ_TZ, to_kz, kz_date
+from links import extract_message_id, extract_channel_name, find_telegram_links
+from matching import combined_score, greedy_assign
+from onboarding_logic import normalize_phone, run_self_check
+from connectivity import with_reconnect
+from model_loader import load_models, bge_total_bytes, dir_size_bytes, bge_cache_folder
 from sentence_transformers import SentenceTransformer, util
 
-# Импортируем данные API из конфигурационного файла
+
+import app_paths
+from credentials import get_api_credentials
+
+app_paths.ensure_dirs()
 try:
-    from config import API_ID, API_HASH, SESSION_NAME, PROXY
-except ImportError:
-    # Если конфигурационный файл отсутствует, показываем сообщение об ошибке
-    print("ERROR: config.py file not found.")
-    print("Please create config.py based on config.example.py with your API credentials.")
-    API_ID = ""
-    API_HASH = ""
-    SESSION_NAME = "TgReportAnalysis"
-    PROXY = None
-except AttributeError:
-    # Если PROXY не определен в config.py
-    PROXY = None
+    API_ID, API_HASH = get_api_credentials()
+except RuntimeError as e:
+
+
+    print(f"CONFIG ERROR: {e}")
+    raise
+
+SESSION_NAME = app_paths.session_file()
+PROXY = None
 
 # Channels to compare with
 channels = {
@@ -43,14 +54,12 @@ channels = {
 }
 target_channel = 'zakonkz'
 
-# Load Russian language model
-nlp = spacy.load("ru_core_news_lg")
 similarity_threshold = 0.5  # Порог сходства для USER-bge-m3 (нормализованные эмбеддинги)
 
 
-# Загрузка модели Sentence Transformer
-# deepvk/USER-bge-m3 — bge-m3 дообученная на 2.2M русских пар, лидер ruMTEB STS (75.3)
-sentence_model = SentenceTransformer('deepvk/USER-bge-m3')
+global nlp, sentence_model
+nlp = None
+sentence_model = None
 
 def preprocess_text(text):
     """Очистка текста от URL, username, хештегов и другого шума."""
@@ -314,11 +323,9 @@ class TelegramAuthDialog(QDialog):
         try:
             self.status_label.setText("Отправка кода...")
             
-            # Проверяем, что номер телефона в правильном формате
-            if not self.phone.startswith('+'):
-                print("Добавляем + к номеру телефона")
-                self.phone = '+' + self.phone
-                self.phone_input.setText(self.phone)
+
+            self.phone = normalize_phone(self.phone)
+            self.phone_input.setText(self.phone)
             
             print(f"Используемый номер телефона: {self.phone}")
             
@@ -526,18 +533,27 @@ class TelegramAuthDialog(QDialog):
             self.verify_code_btn.setEnabled(True)
             
         except SessionPasswordNeededError:
-            print("Требуется двухфакторная аутентификация")
-            error_msg = ("Требуется двухфакторная аутентификация. " +
-                "Пожалуйста, отключите её в настройках Telegram или " +
-                "используйте другой аккаунт.")
-            QMessageBox.warning(self, "Ошибка", error_msg)
-            self.status_label.setText("Требуется двухфакторная аутентификация")
-            
-            # Предоставляем возможность ввести другой номер телефона
-            self.phone_input.setEnabled(True)
-            self.send_code_btn.setEnabled(True)
-            self.code_input.setEnabled(False)
-            self.verify_code_btn.setEnabled(False)
+            print("Требуется двухфакторная аутентификация — запрашиваем пароль")
+            self.status_label.setText("Требуется пароль двухфакторной аутентификации")
+            password, ok = QInputDialog.getText(
+                self, "Двухфакторная аутентификация",
+                "Введите пароль (облачный пароль Telegram):",
+                QLineEdit.Password,
+            )
+            if not ok or not password:
+                self.status_label.setText("Ввод пароля 2FA отменён")
+                self.verify_code_btn.setEnabled(True)
+                return
+            try:
+                await asyncio.wait_for(self.client.sign_in(password=password), 30)
+                self.status_label.setText("Успешная авторизация (2FA)")
+                print("2FA-пароль принят")
+                QTimer.singleShot(1000, self.accept)
+            except Exception as e:
+                print(f"Ошибка 2FA: {e}")
+                QMessageBox.critical(self, "Ошибка", f"Неверный пароль 2FA: {e}")
+                self.status_label.setText("Неверный пароль 2FA")
+                self.verify_code_btn.setEnabled(True)
             
         except Exception as e:
             error_message = str(e)
@@ -565,6 +581,7 @@ class TelegramAuthDialog(QDialog):
             print("Создание основного окна")
             self.main_window = NewsAnalyzerApp(self.client)  # Сохраняем ссылку на основное окно
             self.main_window.show()
+            self.main_window.run_self_check_async()
             print("Основное окно отображено")
             # Используем QTimer для небольшой задержки перед закрытием диалога
             QTimer.singleShot(500, lambda: self._complete_accept())
@@ -606,12 +623,116 @@ class TelegramAuthDialog(QDialog):
         QTimer.singleShot(100, QApplication.quit)
         event.accept()
 
+
+class QRAuthDialog(QDialog):
+    """Авторизация через QR-код: пользователь сканирует код в Telegram.
+
+    Не нужен SMS/код подтверждения — обходит проблему недоставки кода.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.client = None
+        self.main_window = None
+        self._authorized = False
+        self.setWindowTitle("Вход в Telegram — QR-код")
+        self.setFixedSize(440, 560)
+        layout = QVBoxLayout()
+
+        title = QLabel("Вход через QR-код")
+        title.setAlignment(Qt.AlignCenter)
+        f = title.font(); f.setPointSize(16); f.setBold(True); title.setFont(f)
+        layout.addWidget(title)
+
+        steps = QLabel(
+            "1. Откройте Telegram на телефоне\n"
+            "2. Настройки → Устройства → Подключить устройство\n"
+            "3. Наведите камеру на QR-код ниже"
+        )
+        steps.setAlignment(Qt.AlignCenter)
+        layout.addWidget(steps)
+
+        self.qr_label = QLabel()
+        self.qr_label.setAlignment(Qt.AlignCenter)
+        self.qr_label.setFixedSize(300, 300)
+        layout.addWidget(self.qr_label, alignment=Qt.AlignCenter)
+
+        self.status_label = QLabel("Подключение к Telegram…")
+        self.status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.status_label)
+
+        self.setLayout(layout)
+        asyncio.ensure_future(self._run())
+
+    def _render_qr(self, url):
+        matrix = qr_matrix(url)
+        n = len(matrix)
+        scale = max(4, 290 // n)
+        size = n * scale
+        pix = QPixmap(size, size)
+        pix.fill(Qt.white)
+        p = QPainter(pix)
+        p.setPen(Qt.NoPen)
+        p.setBrush(Qt.black)
+        for y, row in enumerate(matrix):
+            for x, val in enumerate(row):
+                if val:
+                    p.drawRect(x * scale, y * scale, scale, scale)
+        p.end()
+        self.qr_label.setPixmap(pix)
+
+    async def _run(self):
+        try:
+            self.client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+            await self.client.connect()
+            if await self.client.is_user_authorized():
+                self._success()
+                return
+            self.status_label.setText("Отсканируйте QR-код в приложении Telegram")
+            while not self._authorized:
+                qr = await self.client.qr_login()
+                self._render_qr(qr.url)
+                try:
+                    await qr.wait(timeout=30)
+                    self._authorized = True
+                except asyncio.TimeoutError:
+                    self.status_label.setText("QR обновлён — отсканируйте заново")
+                    continue
+                except SessionPasswordNeededError:
+                    password, ok = QInputDialog.getText(
+                        self, "Двухфакторная аутентификация",
+                        "Введите облачный пароль Telegram:", QLineEdit.Password
+                    )
+                    if not ok or not password:
+                        self.status_label.setText("Вход отменён")
+                        return
+                    await self.client.sign_in(password=password)
+                    self._authorized = True
+            self._success()
+        except Exception as e:
+            print(f"Ошибка QR-авторизации: {e}")
+            self.status_label.setText(f"Ошибка: {str(e)[:80]}")
+
+    def _success(self):
+        print("QR-авторизация успешна")
+        self.status_label.setText("Успешный вход!")
+        self.main_window = NewsAnalyzerApp(self.client)
+        self.main_window.show()
+        self.main_window.run_self_check_async()
+        QTimer.singleShot(600, self.accept)
+
+    def closeEvent(self, event):
+
+        if not self._authorized:
+            QTimer.singleShot(100, QApplication.quit)
+        event.accept()
+
+
 class NewsAnalyzerApp(QMainWindow):
     progress_signal = pyqtSignal(int)
     
     def __init__(self, telegram_client):
         super().__init__()
-        self.setWindowTitle("Telegram News Analyzer")
+        self.setWindowTitle("News Analyzer")
         self.setGeometry(100, 100, 1000, 600)
         self.news_data = []  # Will store data from Word file
         self.results = []  # Will store analysis results
@@ -682,25 +803,34 @@ class NewsAnalyzerApp(QMainWindow):
         return self.load_word_file()  # Возвращаем корутину напрямую
 
     def parse_docx(self, file_path):
-        """Extract only Telegram links from a .docx file"""
+        """Extract all Telegram links from a .docx file.
+
+        Поддерживает оба формата: ссылка на отдельной строке И ссылка
+        внутри строки после заголовка ("Заголовок новости https://t.me/...").
+        Дедуплицирует и дополняет ссылками из гиперссылок-relationships.
+        """
         doc = Document(file_path)
         links = []
+        seen = set()
         
         print(f"Анализирую документ: {file_path}")
         
         # Просматриваем все абзацы для поиска ссылок
         for paragraph in doc.paragraphs:
-            text = paragraph.text.strip()
-            if text.startswith("https://t.me"):
-                links.append(text)
-                print(f"Найдена ссылка: {text}")
+            for url in find_telegram_links(paragraph.text):
+                if url not in seen:
+                    seen.add(url)
+                    links.append(url)
+                    print(f"Найдена ссылка: {url}")
         
-        # Если основной метод не нашел ссылок, извлекаем гиперссылки напрямую
-        if not links:
-            print("Прямой метод не нашел ссылок, извлекаем гиперссылки из документа")
-            for rel_id, rel in doc.part.rels.items():
-                if "hyperlink" in rel.reltype and "t.me/" in rel._target:
-                    links.append(rel._target)
+        
+        for rel_id, rel in doc.part.rels.items():
+            if "hyperlink" in rel.reltype and "t.me/" in rel._target:
+                url = rel._target
+                if url not in seen:
+                    seen.add(url)
+                    links.append(url)
+                    print(f"Найдена гиперссылка: {url}")
                     print(f"Найдена гиперссылка: {rel._target}")
         
         print(f"Всего найдено {len(links)} ссылок в документе")
@@ -722,11 +852,10 @@ class NewsAnalyzerApp(QMainWindow):
                 if not message_id:
                     return "Ссылка не распознана"
 
-                match = re.search(r'https?://t\.me/([^/]+)', link)
-                if not match:
+                channel_name = extract_channel_name(link)
+                if not channel_name:
                     return "Неверный формат ссылки"
 
-                channel_name = match.group(1)
                 print(f"Запрос сообщения из канала {channel_name}, ID: {message_id}")
 
                 try:
@@ -897,17 +1026,15 @@ class NewsAnalyzerApp(QMainWindow):
 
     def extract_message_id_from_link(self, link):
         """Extract message ID from a Telegram link"""
-        # Format: https://t.me/channel/message_id
-        match = re.search(r'https?://t\.me/[^/]+/(\d+)', link)
-        if match:
-            return int(match.group(1))
-        return None
+        return extract_message_id(link)
 
     async def get_post_from_target_channel(self, message_id):
-        """Get post from target channel using message ID"""
+        """Get post from target channel using message ID (с реконнектом при сбое)"""
         try:
-            await self.ensure_connected()
-            message = await self.client.get_messages(target_channel, ids=message_id)
+            message = await with_reconnect(
+                self.client,
+                lambda: self.client.get_messages(target_channel, ids=message_id),
+            )
             if message and message.text:
                 return {
                     'text': message.text,
@@ -935,7 +1062,7 @@ class NewsAnalyzerApp(QMainWindow):
             await self.ensure_connected()
             # offset_date — начинаем загрузку с конца целевого дня (end_date + 1 день, 00:00 UTC)
             # Telethon вернёт сообщения ДО этой даты, от новых к старым
-            offset_dt = datetime(end_date.year, end_date.month, end_date.day, tzinfo=timezone.utc) + timedelta(days=1)
+            offset_dt = datetime(end_date.year, end_date.month, end_date.day, tzinfo=KZ_TZ) + timedelta(days=1)
 
             message_gen = self.client.iter_messages(
                 channel,
@@ -959,7 +1086,7 @@ class NewsAnalyzerApp(QMainWindow):
                         skipped_posts += 1
                         continue
 
-                    message_date = message.date.date()
+                    message_date = kz_date(message.date)
 
                     # Сообщения идут от новых к старым — если ушли за start_date, выходим
                     if message_date < start_date:
@@ -999,23 +1126,50 @@ class NewsAnalyzerApp(QMainWindow):
 
         return posts
 
-    async def score_all_posts(self, article_text, article_date, channel_posts):
-        """Score all channel posts against an article. Returns list of (post, details) sorted by combined score desc."""
-        if not article_text or not article_text.strip():
-            print("Пустой текст статьи, невозможно оценить посты")
-            return []
+    def _extract_keywords(self, doc):
+        keywords = set()
+        for token in doc:
+            if token.pos_ in ("NOUN", "VERB", "ADJ", "PROPN") and not token.is_stop and len(token.text) > 2:
+                keywords.add(token.lemma_.lower())
+        return keywords
 
+    def _extract_entities(self, doc):
+        entities = set()
+        for ent in doc.ents:
+            if ent.label_ in ("PER", "ORG", "LOC", "GPE"):
+                entities.add(ent.text.lower().strip())
+        return entities
+
+    def _safe_nlp(self, text):
+        try:
+            return nlp(text)
+        except Exception:
+            return nlp(text[:5000])
+
+    async def compute_article_features(self, article_text):
+        """Один раз посчитать эмбеддинг, ключевые слова и сущности статьи."""
+        loop = asyncio.get_event_loop()
+        processed = preprocess_text(article_text)[:10000]
+        embedding = await loop.run_in_executor(
+            None,
+            lambda: sentence_model.encode(processed, convert_to_tensor=True, normalize_embeddings=True)
+        )
+        doc = await loop.run_in_executor(None, self._safe_nlp, processed)
+        keywords = self._extract_keywords(doc)
+        entities = self._extract_entities(doc)
+        return {'processed': processed, 'embedding': embedding,
+                'keywords': keywords, 'entities': entities}
+
+    async def score_all_posts(self, article_features, article_date, channel_posts):
+        """Score all channel posts against an article. Returns list of (post, details) sorted by combined score desc."""
         if not channel_posts:
             print("Нет постов для сравнения")
             return []
 
         try:
-            # 1. Предобработка текста статьи
-            processed_article_text = preprocess_text(article_text)
-            print(f"\nОбработка статьи (длина после очистки: {len(processed_article_text)} символов)")
-
-            if len(processed_article_text) > 10000:
-                processed_article_text = processed_article_text[:10000]
+            article_embedding = article_features['embedding']
+            article_keywords = article_features['keywords']
+            article_entities = article_features['entities']
 
             # 2. Предобработка всех текстов постов (batch)
             valid_posts = []
@@ -1038,46 +1192,33 @@ class NewsAnalyzerApp(QMainWindow):
             print(f"Начинаем оценку постов (порог схожести: {similarity_threshold})")
             print(f"Валидных постов для сравнения: {len(valid_posts)}")
 
-            # 3. Batch encoding — кодируем статью и все посты за один вызов
-            article_embedding = sentence_model.encode(processed_article_text, convert_to_tensor=True, normalize_embeddings=True)
-            post_embeddings = sentence_model.encode(processed_post_texts, batch_size=32, convert_to_tensor=True, normalize_embeddings=True)
+
+            loop = asyncio.get_event_loop()
+            post_embeddings = await loop.run_in_executor(
+                None,
+                lambda: sentence_model.encode(processed_post_texts, batch_size=32,
+                                              convert_to_tensor=True, normalize_embeddings=True)
+            )
 
             # 4. Матричное вычисление cosine similarity
             cos_scores = util.cos_sim(article_embedding, post_embeddings)[0]
 
-            # 5. Batch spaCy обработка для ключевых слов и NER
-            def extract_keywords(doc):
-                keywords = set()
-                for token in doc:
-                    if token.pos_ in ("NOUN", "VERB", "ADJ", "PROPN") and not token.is_stop and len(token.text) > 2:
-                        keywords.add(token.lemma_.lower())
-                return keywords
-
-            def extract_entities(doc):
-                entities = set()
-                for ent in doc.ents:
-                    if ent.label_ in ("PER", "ORG", "LOC", "GPE"):
-                        entities.add(ent.text.lower().strip())
-                return entities
-
-            try:
-                doc_article = nlp(processed_article_text)
-            except Exception:
-                doc_article = nlp(processed_article_text[:5000])
-
-            article_keywords = extract_keywords(doc_article)
-            article_entities = extract_entities(doc_article)
-            print(f"Извлечено {len(article_keywords)} ключевых слов, {len(article_entities)} сущностей из статьи")
+            print(f"Используем {len(article_keywords)} ключевых слов, {len(article_entities)} сущностей из статьи")
             if article_entities:
                 print(f"Сущности: {', '.join(list(article_entities)[:15])}")
 
-            # Batch обработка spaCy через pipe — извлекаем keywords и entities за один проход
-            all_post_keywords = []
-            all_post_entities = []
+
+            def _run_pipe(texts):
+                kws, ents = [], []
+                for d in nlp.pipe(texts, batch_size=50):
+                    kws.append(self._extract_keywords(d))
+                    ents.append(self._extract_entities(d))
+                return kws, ents
+
             try:
-                for doc in nlp.pipe(processed_post_texts, batch_size=50):
-                    all_post_keywords.append(extract_keywords(doc))
-                    all_post_entities.append(extract_entities(doc))
+                all_post_keywords, all_post_entities = await loop.run_in_executor(
+                    None, _run_pipe, processed_post_texts
+                )
             except Exception as e:
                 print(f"Ошибка batch spaCy, переключаемся на поштучную обработку: {e}")
                 all_post_keywords = []
@@ -1085,8 +1226,8 @@ class NewsAnalyzerApp(QMainWindow):
                 for text in processed_post_texts:
                     try:
                         doc = nlp(text)
-                        all_post_keywords.append(extract_keywords(doc))
-                        all_post_entities.append(extract_entities(doc))
+                        all_post_keywords.append(self._extract_keywords(doc))
+                        all_post_entities.append(self._extract_entities(doc))
                     except Exception:
                         all_post_keywords.append(set())
                         all_post_entities.append(set())
@@ -1114,17 +1255,15 @@ class NewsAnalyzerApp(QMainWindow):
                         common_keywords = set()
                         keywords_overlap = 0
 
-                    # Комбинированная оценка: 60% семантика, 25% NER, 15% ключевые слова
-                    combined = (
-                        0.60 * vector_similarity +
-                        0.25 * ner_score +
-                        0.15 * keywords_overlap
-                    )
 
-                    # Штраф за время (вместо бонуса): >24ч — множим на 0.8
+
                     time_diff = abs((article_date - post['date']).total_seconds()) / 3600
-                    if time_diff > 24:
-                        combined *= 0.8
+                    combined = combined_score(
+                        vector=vector_similarity,
+                        ner=ner_score,
+                        keywords=keywords_overlap,
+                        time_diff_hours=time_diff
+                    )
 
                     if combined >= similarity_threshold:
                         details = {
@@ -1204,6 +1343,26 @@ class NewsAnalyzerApp(QMainWindow):
             self.status_label.setText(error_message)
             QMessageBox.critical(self, "Ошибка подключения", error_message)
 
+    def run_self_check_async(self):
+        """Запустить self-check доступа к каналам и показать итог в статусе."""
+        asyncio.ensure_future(self._do_self_check())
+
+    async def _do_self_check(self):
+        try:
+            check = await run_self_check(self.client, target_channel, list(channels.values()))
+        except Exception as e:
+            self.status_label.setText(f"Self-check не выполнен: {e}")
+            return
+        if not check["problems"]:
+            self.status_label.setText("Проверка пройдена: связь и все каналы доступны")
+        else:
+            down = [n for n, ok in check["channels"].items() if not ok]
+            msg = "Внимание: " + "; ".join(check["problems"][:4])
+            self.status_label.setText(msg)
+            if not check["target_ok"] or down:
+                QMessageBox.warning(self, "Проверка доступа",
+                                    "Есть проблемы с доступом:\n" + "\n".join(check["problems"]))
+
     async def start_analysis(self):
         """Start the analysis process with greedy deduplication per channel."""
         print("Начало анализа")
@@ -1216,6 +1375,27 @@ class NewsAnalyzerApp(QMainWindow):
             self.load_button.setEnabled(False)
             self.analyze_button.setEnabled(False)
             self.status_label.setText("Анализ запущен...")
+
+
+            self.status_label.setText("Проверка связи и доступа к каналам…")
+            preflight = await run_self_check(self.client, target_channel, list(channels.values()))
+            if not preflight['authorized']:
+                self.status_label.setText("Нет авторизации в Telegram. Перезапустите приложение.")
+                QMessageBox.critical(self, "Нет связи",
+                                     "Не удалось подтвердить авторизацию в Telegram.\n"
+                                     "Проверьте интернет и перезапустите приложение.")
+                return
+            if not preflight['target_ok']:
+                self.status_label.setText(f"Нет доступа к каналу {target_channel}.")
+                QMessageBox.critical(self, "Нет доступа",
+                                     f"Не удалось получить доступ к каналу {target_channel}.\n"
+                                     "Проверьте интернет-соединение и попробуйте снова.")
+                return
+            down_channels = [n for n, ok in preflight['channels'].items() if not ok]
+            if down_channels:
+                QMessageBox.warning(self, "Часть каналов недоступна",
+                                    "Недоступны каналы: " + ", ".join(down_channels) +
+                                    "\nАнализ продолжится по доступным каналам.")
 
             # Reset results
             self.results = []
@@ -1252,12 +1432,12 @@ class NewsAnalyzerApp(QMainWindow):
                     continue
 
                 found_articles += 1
+                article['features'] = await self.compute_article_features(article['text'])
                 articles_data.append((row_idx, link, article))
 
                 # Заполняем столбцы Zakon
                 self.table.setItem(row_idx, 1, QTableWidgetItem(article['link']))
-                gmt5_time = article['date'] + timedelta(hours=5)
-                self.table.setItem(row_idx, 2, QTableWidgetItem(gmt5_time.strftime("%H:%M:%S")))
+                self.table.setItem(row_idx, 2, QTableWidgetItem(to_kz(article['date']).strftime("%H:%M:%S")))
 
                 progress_percent = int((row_idx + 1) * 50 / total_articles)
                 self.progress_signal.emit(progress_percent)
@@ -1275,22 +1455,28 @@ class NewsAnalyzerApp(QMainWindow):
                 # Собираем все scores: [(row_idx, post, details), ...]
                 all_candidates = []
 
+                channel_error = None
                 for art_idx, (row_idx, link, article) in enumerate(articles_data):
                     if article is None:
                         continue
 
-                    target_date = article['date'].date()
+                    target_date = kz_date(article['date'])
 
                     # Загружаем посты с кэшированием
                     cache_key = (channel_id, target_date)
                     if cache_key in self.posts_cache:
                         channel_posts = self.posts_cache[cache_key]
                     else:
-                        channel_posts = await self.fetch_channel_posts(channel_id, target_date, target_date)
-                        self.posts_cache[cache_key] = channel_posts
+                        try:
+                            channel_posts = await self.fetch_channel_posts(channel_id, target_date, target_date)
+                            self.posts_cache[cache_key] = channel_posts
+                        except Exception as e:
+                            print(f"Сбой загрузки {channel_id} за {target_date}: {e}")
+                            channel_error = str(e)
+                            channel_posts = []
 
                     # Получаем все scores для этой статьи
-                    scored = await self.score_all_posts(article['text'], article['date'], channel_posts)
+                    scored = await self.score_all_posts(article['features'], article['date'], channel_posts)
 
                     for post, details in scored:
                         all_candidates.append((row_idx, post, details))
@@ -1301,20 +1487,17 @@ class NewsAnalyzerApp(QMainWindow):
                         self.status_label.setText(
                             f"Канал {channel_name}: оценено {art_idx + 1}/{total_articles} статей...")
 
-                # Жадное назначение по убыванию combined score
-                all_candidates.sort(key=lambda x: x[2]['combined'], reverse=True)
 
-                assigned_posts = set()   # ссылки постов уже назначенных
-                assigned_rows = set()    # строки уже получившие пост
-                assignments = {}         # row_idx -> (post, details)
 
+
+                detail_by_key = {}
+                score_candidates = []
                 for row_idx, post, details in all_candidates:
-                    post_link = post['link']
-                    if row_idx in assigned_rows or post_link in assigned_posts:
-                        continue
-                    assignments[row_idx] = (post, details)
-                    assigned_posts.add(post_link)
-                    assigned_rows.add(row_idx)
+                    detail_by_key[(row_idx, post['link'])] = (post, details)
+                    score_candidates.append((row_idx, post['link'], details['combined']))
+
+                assigned = greedy_assign(score_candidates)
+                assignments = {row_idx: detail_by_key[(row_idx, link)] for row_idx, link in assigned.items()}
 
                 print(f"\nКанал {channel_name}: назначено {len(assignments)} уникальных совпадений")
 
@@ -1323,13 +1506,16 @@ class NewsAnalyzerApp(QMainWindow):
                     if row_idx in assignments:
                         post, details = assignments[row_idx]
                         self.table.setItem(row_idx, col_idx, QTableWidgetItem(post['link']))
-                        gmt5_time = post['date'] + timedelta(hours=5)
-                        self.table.setItem(row_idx, col_idx + 1, QTableWidgetItem(gmt5_time.strftime("%H:%M:%S")))
+                        self.table.setItem(row_idx, col_idx + 1, QTableWidgetItem(to_kz(post['date']).strftime("%H:%M:%S")))
                         found_matches[channel_name] += 1
                         print(f"  [{row_idx}] -> {post['link']} (combined={details['combined']:.4f})")
                     else:
                         self.table.setItem(row_idx, col_idx, QTableWidgetItem("Не найдено"))
                         self.table.setItem(row_idx, col_idx + 1, QTableWidgetItem(""))
+
+                if channel_error:
+                    self.status_label.setText(
+                        f"Канал {channel_name}: были проблемы со связью, результат может быть неполным")
 
                 col_idx += 2
 
@@ -1404,34 +1590,85 @@ class NewsAnalyzerApp(QMainWindow):
             except Exception as e:
                 self.status_label.setText(f"Ошибка при экспорте: {str(e)}")
 
-async def main():
-    """Main application entry point"""
+async def main(app):
+    """Main application entry point (qasync canonical pattern)."""
     print("Запуск приложения")
+    app_close_event = asyncio.Event()
+    app.aboutToQuit.connect(app_close_event.set)
+
+    global nlp, sentence_model
+
+
+    loading = QDialog()
+    loading.setWindowTitle("News Analyzer — загрузка")
+
+    loading.setWindowFlags(Qt.Window | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+    loading.setFixedSize(480, 150)
+    _loading_layout = QVBoxLayout(loading)
+    _loading_label = QLabel("Загрузка моделей…")
+    _loading_label.setAlignment(Qt.AlignCenter)
+    _loading_layout.addWidget(_loading_label)
+    _loading_bar = QProgressBar()
+    _loading_bar.setRange(0, 100)
+    _loading_bar.setValue(0)
+    _loading_layout.addWidget(_loading_bar)
+    _loading_sub = QLabel("Подготовка…")
+    _loading_sub.setAlignment(Qt.AlignCenter)
+    _loading_layout.addWidget(_loading_sub)
+    loading.show()
+    app.processEvents()
+
+    loop = asyncio.get_event_loop()
+
+    total_bytes = await loop.run_in_executor(None, bge_total_bytes)
+    cache_dir = bge_cache_folder()
+
+    def _update_loading_progress():
+        done = dir_size_bytes(cache_dir)
+        mb_done = done / (1024 * 1024)
+        mb_total = total_bytes / (1024 * 1024)
+        if total_bytes and done >= total_bytes * 0.999:
+            _loading_bar.setValue(99)
+            _loading_sub.setText(f"Почти готово, загрузка в память… ({mb_done:.0f} МБ)")
+        else:
+            pct = min(99, int(done * 100 / total_bytes)) if total_bytes else 0
+            _loading_bar.setValue(pct)
+            _loading_sub.setText(f"Скачано {mb_done:.0f} из ~{mb_total:.0f} МБ")
+
+    _loading_timer = QTimer()
+    _loading_timer.timeout.connect(_update_loading_progress)
+    _loading_timer.start(500)
+    _update_loading_progress()
+
     try:
-        # Создаем приложение Qt
-        app = QApplication(sys.argv)
-        
-        # Создаем и настраиваем событийный цикл qasync
-        print("Настройка событийного цикла")
-        loop = QEventLoop(app)
-        asyncio.set_event_loop(loop)
-        
-        # Создаем диалог авторизации
-        print("Создание диалога авторизации")
-        auth_dialog = TelegramAuthDialog()
-        
-        print("Отображение диалога авторизации")
-        auth_dialog.show()
-        
-        # Запускаем событийный цикл
-        print("Запуск событийного цикла")
-        with loop:
-            loop.run_forever()
-            
+        nlp, sentence_model = await loop.run_in_executor(None, load_models)
     except Exception as e:
-        error_message = str(e)
-        print(f"Ошибка в функции main: {error_message}")
-        QMessageBox.critical(None, "Критическая ошибка", f"Ошибка при запуске приложения: {error_message}")
+        _loading_timer.stop()
+        loading.close()
+        box = QMessageBox(None)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("Ошибка загрузки моделей")
+        box.setText(f"Не удалось загрузить модели:\n{e}\n\n"
+                    "Проверьте интернет-соединение и перезапустите приложение.")
+        save_btn = box.addButton("Сохранить отчёт…", QMessageBox.ActionRole)
+        box.addButton(QMessageBox.Close)
+        box.exec_()
+        if box.clickedButton() is save_btn:
+            import diagnostics
+            path, _ = QFileDialog.getSaveFileName(None, "Сохранить отчёт", "news-analyzer-report.txt")
+            if path:
+                diagnostics.save_report(path)
+        app.quit()
+        return
+    _loading_timer.stop()
+    _loading_bar.setValue(100)
+    loading.close()
+
+    print("Создание диалога авторизации")
+    auth_dialog = QRAuthDialog()
+    auth_dialog.show()
+
+    await app_close_event.wait()
 
 def main_test():
     """Тестовая функция для проверки сопоставления заголовков и ссылок"""
@@ -1525,15 +1762,20 @@ def main_test():
     sys.exit(app.exec_())
 
 if __name__ == "__main__":
-    # Используем try-except для обработки ошибок при запуске
     try:
-        # Для тестирования сопоставления заголовков и ссылок
         if len(sys.argv) > 1 and sys.argv[1] == "--test":
             main_test()
         else:
-            # Запускаем основную функцию через asyncio.run
-            print("Запуск main() через asyncio.run()")
-            asyncio.run(main())
+            import diagnostics
+            diagnostics.enable_file_logging()
+            print("Запуск main() через QEventLoop loop_factory")
+            app = QApplication(sys.argv)
+            app.setApplicationName("News Analyzer")
+            app.setApplicationDisplayName("News Analyzer")
+            _icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "icon_1024.png")
+            if os.path.exists(_icon_path):
+                app.setWindowIcon(QIcon(_icon_path))
+            asyncio.run(main(app), loop_factory=lambda: QEventLoop(app))
     except Exception as e:
         print(f"Критическая ошибка при запуске приложения: {str(e)}")
         traceback.print_exc() 

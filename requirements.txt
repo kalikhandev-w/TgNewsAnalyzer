@@ -1,10 +1,17 @@
-python-docx==0.8.11
-PyQt5==5.15.10
-pandas==2.2.0
-openpyxl==3.1.2
-telethon==1.33.1
-spacy==3.7.2
+python-docx==1.2.0
+PyQt5==5.15.11
+pandas==3.0.3
+openpyxl==3.1.5
+telethon==1.44.0
+spacy==3.7.5
 qasync==0.27.1
-sentence-transformers>=2.0.0
-pyarrow>=10.0.0
-ru_core_news_lg @ https://github.com/explosion/spacy-models/releases/download/ru_core_news_lg-3.7.0/ru_core_news_lg-3.7.0-py3-none-any.whl 
+sentence-transformers==5.5.1
+pyarrow==24.0.0
+qrcode==8.2
+pymorphy3==2.0.6
+huggingface_hub==0.36.2
+# Pinned as shipped in 1.0: torch 2.2.x is the last line with macOS x86_64 wheels, it needs numpy<2
+torch==2.2.2
+numpy==1.26.4
+transformers==4.46.3
+ru_core_news_lg @ https://github.com/explosion/spacy-models/releases/download/ru_core_news_lg-3.7.0/ru_core_news_lg-3.7.0-py3-none-any.whl

@@ -26,3 +26,4 @@ Thumbs.db
 
 # Configuration with sensitive data
 config.py
+_embedded_creds.py
