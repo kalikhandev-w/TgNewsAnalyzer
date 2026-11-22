@@ -14,4 +14,7 @@ huggingface_hub==0.36.2
 torch==2.2.2
 numpy==1.26.4
 transformers==4.46.3
+# spaCy 3.7 imports click directly; newer typer releases no longer pull it in
+typer==0.25.1
+click==8.4.1
 ru_core_news_lg @ https://github.com/explosion/spacy-models/releases/download/ru_core_news_lg-3.7.0/ru_core_news_lg-3.7.0-py3-none-any.whl
