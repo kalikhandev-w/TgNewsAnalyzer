@@ -48,7 +48,7 @@ PROXY = None
 # Channels to compare with
 channels = {
     'Nur': 'newsnurkz',
-    'Orda': 'orda_kz',
+    'Atameken': 'atamekenbusiness',
     'ZTB': 'ztb_qaz',
     'Sputnik': 'sputnikKZ'
 }
@@ -777,7 +777,7 @@ class NewsAnalyzerApp(QMainWindow):
         self.table.setColumnCount(11)  # Увеличиваем количество столбцов с 6 до 11
         self.table.setHorizontalHeaderLabels([
             "Название статьи", "Zakon", "Zakon время", "Nur", "Nur время", 
-            "Orda", "Orda время", "ZTB", "ZTB время", "Sputnik", "Sputnik время"
+            "Atameken", "Atameken время", "ZTB", "ZTB время", "Sputnik", "Sputnik время"
         ])
         
         # Set table to stretch to fill the available space

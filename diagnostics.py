@@ -9,7 +9,7 @@ import platform
 
 import app_paths
 
-APP_VERSION = "1.0"
+APP_VERSION = "1.1"
 
 
 class Tee:
